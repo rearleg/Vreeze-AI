@@ -1,3 +1,15 @@
+import os
+
+from trainer import Trainer, TrainerArgs
+import torch
+from peft import LoraConfig, get_peft_model, TaskType
+from tqdm import tqdm
+
+from TTS.TTS.config.shared_configs import BaseDatasetConfig
+from TTS.TTS.tts.datasets import load_tts_samples
+from TTS.TTS.tts.layers.xtts.trainer.gpt_trainer import GPTArgs, GPTTrainer, GPTTrainerConfig, XttsAudioConfig
+from TTS.TTS.utils.manage import ModelManager
+
 # Logging parameters
 RUN_NAME = "GPT_XTTS_v2.0_LJSpeech_FT_LoRA"
 PROJECT_NAME = "XTTS_trainer_LoRA"
@@ -16,8 +28,8 @@ GRAD_ACUMM_STEPS = 64  # 배치 크기와 비례하여 조정
 # 데이터셋 설정
 config_dataset = BaseDatasetConfig(
     formatter="ljspeech",
-    dataset_name="ljspeech",
-    path="/Users/changhyeoncheon/dev/Vreeze-AI/wavs_processed",
+    dataset_name="audio",
+    path="/Users/changhyeoncheon/dev/Vreeze-AI",
     meta_file_train="/Users/changhyeoncheon/dev/Vreeze-AI/metadata.txt",
     language="ko",
 )
@@ -55,7 +67,7 @@ if not os.path.isfile(TOKENIZER_FILE) or not os.path.isfile(XTTS_CHECKPOINT):
 
 # 테스트용 화자 참조
 SPEAKER_REFERENCE = [
-    "./tests/data/ljspeech/wavs/LJ001-0002.wav"
+    "/Users/changhyeoncheon/dev/Vreeze-AI/wavs/audio138.wav"
 ]
 LANGUAGE = config_dataset.language
 
@@ -66,29 +78,65 @@ LORA_DROPOUT = 0.05  # LoRA 드롭아웃 비율
 TARGET_MODULES = ["q_proj", "v_proj", "k_proj", "o_proj"]  # LoRA를 적용할 모듈
 
 def apply_lora_to_model(model):
-    """모델에 LoRA를 적용하는 함수"""
+    """GPTTrainer 모델에 LoRA를 적용하는 함수"""
+    # GPTTrainer 클래스에서는 xtts.gpt.gpt를 통해 GPT 모델에 접근
+    target_module = model.xtts.gpt.gpt
+    
     # LoRA 설정 생성
     lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,  # 캐주얼 LM 태스크 유형
-        r=LORA_RANK,
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=LORA_DROPOUT,
-        target_modules=TARGET_MODULES,
+        task_type=TaskType.CAUSAL_LM,  # 이 부분이 중요합니다!
+        r=8,                      # LoRA 랭크
+        lora_alpha=16,            # LoRA 알파
+        lora_dropout=0.05,        # 드롭아웃 비율
+        # GPT2 모델의 주요 어텐션 모듈
+        target_modules=["c_attn", "c_proj"],
         bias="none",
         inference_mode=False,
     )
     
-    # 모델에 LoRA 적용
-    lora_model = get_peft_model(model.gpt, lora_config)
-    model.gpt = lora_model
-    
-    # LoRA 파라미터만 훈련 가능하도록 설정
-    for param in model.gpt.parameters():
-        param.requires_grad = False
-    
-    for name, param in model.gpt.named_parameters():
-        if "lora" in name:
-            param.requires_grad = True
+    try:
+        # 모델에 LoRA 적용
+        print("LoRA를 GPT 모델에 적용합니다...")
+        
+        # 원본 forward 메서드 보존
+        original_forward = target_module.forward
+        
+        # LoRA 모델 생성
+        lora_model = get_peft_model(target_module, lora_config)
+        model.xtts.gpt.gpt = lora_model
+        
+        # original_forward 메서드를 lora_model에 연결
+        def custom_forward(*args, **kwargs):
+            # 'labels' 인수 제거 (필요한 경우)
+            if 'labels' in kwargs:
+                del kwargs['labels']
+            return original_forward(*args, **kwargs)
+        
+        # 커스텀 forward 메서드 설정
+        model.xtts.gpt.gpt.model.forward = custom_forward
+        
+        # LoRA 파라미터만 훈련 가능하도록 설정
+        print("모든 파라미터를 freeze 합니다...")
+        for param in model.parameters():
+            param.requires_grad = False
+        
+        # LoRA 파라미터 훈련 가능하게 설정
+        print("LoRA 파라미터를 훈련 가능하게 설정합니다...")
+        trainable_params = 0
+        all_params = 0
+        
+        for name, param in model.named_parameters():
+            all_params += param.numel()
+            if "lora" in name:
+                param.requires_grad = True
+                trainable_params += param.numel()
+                print(f"훈련 가능한 LoRA 파라미터: {name}")
+        
+        print(f"전체 파라미터: {all_params:,} 개")
+        print(f"훈련 가능한 파라미터: {trainable_params:,} 개 ({trainable_params / all_params:.2%})")
+        print("LoRA가 성공적으로 적용되었습니다.")
+    except Exception as e:
+        print(f"LoRA 적용 중 오류 발생: {str(e)}")
     
     return model
 
@@ -96,7 +144,7 @@ def main():
     # 모델 인자 설정
     model_args = GPTArgs(
         max_conditioning_length=132300,
-        min_conditioning_length=66150,
+        min_conditioning_length=20000, #66150
         debug_loading_failures=False,
         max_wav_length=255995,
         max_text_length=200,
@@ -150,7 +198,7 @@ def main():
                 "language": LANGUAGE,
             },
             {
-                "text": "This cake is great. It's so delicious and moist.",
+                "text": "브라우저로 다음 주소에 접속하면, 텐서보드 대시보드를 볼 수 있습니다. 저는 TTS입니다.",
                 "speaker_wav": SPEAKER_REFERENCE,
                 "language": LANGUAGE,
             },
@@ -170,6 +218,60 @@ def main():
         eval_split_max_size=config.eval_split_max_size,
         eval_split_size=config.eval_split_size,
     )
+
+    if not eval_samples:
+        print("경고: 평가 데이터셋이 비어 있습니다. 훈련 데이터셋에서 일부를 가져옵니다.")
+        num_eval_samples = min(10, len(train_samples))  # 최소 10개 또는 전체 훈련 샘플 수
+        eval_samples = train_samples[:num_eval_samples]
+        train_samples = train_samples[num_eval_samples:]
+        print(f"평가 데이터셋 크기: {len(eval_samples)}")
+        print(f"훈련 데이터셋 크기: {len(train_samples)}")
+        # 평가 샘플 확인 및 처리
+    print(f"초기 평가 샘플 수: {len(eval_samples)}")
+    
+    # 평가 샘플이 없거나 너무 적은 경우
+    if len(eval_samples) < 5:  # 최소 5개 이상의 샘플이 필요하다고 가정
+        print("평가 데이터셋이 부족합니다. 훈련 데이터셋에서 추가 샘플을 가져옵니다.")
+        
+        # 훈련 샘플의 유효성 미리 확인 (필터링 테스트)
+        valid_train_samples = []
+        for sample in train_samples[:50]:  # 처음 50개 샘플만 확인
+            # 필터링 로직 추가 - 오디오 파일이 존재하고 접근 가능한지 확인
+            audio_file = sample.get("audio_file", None) or sample.get("wav_file", None)
+            if audio_file and os.path.exists(audio_file) and os.path.getsize(audio_file) > 0:
+                try:
+                    # 간단한 오디오 메타데이터 확인 (선택적)
+                    import wave
+                    with wave.open(audio_file, 'rb') as wf:
+                        if wf.getnframes() > 0:
+                            valid_train_samples.append(sample)
+                except Exception as e:
+                    print(f"오디오 파일 확인 중 오류: {audio_file} - {str(e)}")
+                    continue
+        
+        print(f"유효한 훈련 샘플 수: {len(valid_train_samples)}")
+        
+        # 유효한 샘플에서 평가 데이터 추가
+        num_eval_samples = min(10, len(valid_train_samples))
+        new_eval_samples = valid_train_samples[:num_eval_samples]
+        
+        # 기존 평가 샘플에 추가
+        if eval_samples:
+            eval_samples.extend(new_eval_samples)
+        else:
+            eval_samples = new_eval_samples
+            
+        # 사용한 샘플은 훈련 데이터에서 제외 (선택적)
+        train_sample_ids = set(s.get("audio_file", "") for s in train_samples)
+        eval_sample_ids = set(s.get("audio_file", "") for s in eval_samples)
+        train_samples = [s for s in train_samples if s.get("audio_file", "") not in eval_sample_ids]
+        
+        print(f"최종 평가 데이터셋 크기: {len(eval_samples)}")
+        print(f"최종 훈련 데이터셋 크기: {len(train_samples)}")
+    
+    # 최종 확인 - 평가 데이터가 여전히 비어 있으면 오류 발생
+    if not eval_samples:
+        raise ValueError("유효한 평가 샘플을 생성할 수 없습니다. 데이터셋을 확인하세요.")
 
     # 훈련 시작
     trainer = Trainer(
